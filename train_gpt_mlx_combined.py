@@ -94,16 +94,14 @@ class Hyperparameters:
     muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
-    # Wasserstein loss hyperparameters
-    wasserstein_alpha: float = float(os.environ.get("WASSERSTEIN_ALPHA", 0.9))  # 1.0 = pure CE, 0.0 = pure Wasserstein
-    wasserstein_cost_metric: str = os.environ.get("WASSERSTEIN_COST_METRIC", "cosine")  # "cosine" or "euclidean"
-    wasserstein_cost_update_every: int = int(os.environ.get("WASSERSTEIN_COST_UPDATE_EVERY", 100))  # recompute cost matrix every N steps
-    wasserstein_squared: bool = bool(int(os.environ.get("WASSERSTEIN_SQUARED", "0")))  # use squared distances (EMD²)
-    wasserstein_normalize: bool = bool(int(os.environ.get("WASSERSTEIN_NORMALIZE", "0")))  # normalize cost matrix to [0,1]
-    wasserstein_focal_gamma: float = float(os.environ.get("WASSERSTEIN_FOCAL_GAMMA", 0.0))  # >0 enables focal weighting
-    wasserstein_delay_steps: int = int(os.environ.get("WASSERSTEIN_DELAY_STEPS", 0))  # pure CE for first N steps
-    wasserstein_softmax_temp: float = float(os.environ.get("WASSERSTEIN_SOFTMAX_TEMP", 1.0))  # temperature for Wasserstein softmax
-    wasserstein_random_cost: bool = bool(int(os.environ.get("WASSERSTEIN_RANDOM_COST", "0")))  # use random cost matrix (ablation test)
+    # STP (Semantic Tube Prediction) — smoothness constraint on hidden states
+    stp_beta: float = float(os.environ.get("STP_BETA", 0.005))
+    stp_layer: str = os.environ.get("STP_LAYER", "last")
+
+    # Wasserstein — differentiated weighting of wrong tokens
+    wasserstein_alpha: float = float(os.environ.get("WASSERSTEIN_ALPHA", 0.9))
+    wasserstein_cost_metric: str = os.environ.get("WASSERSTEIN_COST_METRIC", "cosine")
+    wasserstein_cost_update_every: int = int(os.environ.get("WASSERSTEIN_COST_UPDATE_EVERY", 100))
 
     out_dir: str = os.environ.get("OUT_DIR", "logs")
 
@@ -390,22 +388,17 @@ class Block(nn.Module):
         return x
 
 
-def compute_cost_matrix(embeddings: mx.array, metric: str = "cosine",
-                        squared: bool = False, normalize: bool = False) -> mx.array:
-    """Compute pairwise distance matrix between all token embeddings.
+def stp_smoothness_loss(hidden_states: mx.array) -> mx.array:
+    """Semantic Tube Prediction — smoothness constraint on hidden state trajectories."""
+    h_prev = hidden_states[:, :-2, :]
+    h_curr = hidden_states[:, 1:-1, :]
+    h_next = hidden_states[:, 2:, :]
+    acceleration = h_next - 2.0 * h_curr + h_prev
+    return mx.mean(acceleration * acceleration)
 
-    This is the 'ground cost' for Wasserstein distance — it defines
-    how far apart each pair of tokens is in semantic space.
 
-    Args:
-        embeddings: token embedding table (vocab_size, dim)
-        metric: "cosine" (1 - cosine_similarity) or "euclidean"
-        squared: if True, square the distances (EMD² — penalizes far tokens more)
-        normalize: if True, normalize cost matrix to [0, 1] range
-
-    Returns:
-        cost_matrix: (vocab_size, vocab_size) pairwise distances
-    """
+def compute_cost_matrix(embeddings: mx.array, metric: str = "cosine") -> mx.array:
+    """Compute pairwise distance matrix between token embeddings for Wasserstein loss."""
     emb = embeddings.astype(mx.float32)
     if metric == "cosine":
         norms = mx.sqrt(mx.sum(emb * emb, axis=1, keepdims=True) + 1e-8)
@@ -416,89 +409,34 @@ def compute_cost_matrix(embeddings: mx.array, metric: str = "cosine",
         sq_norms = mx.sum(emb * emb, axis=1)
         cost = sq_norms[:, None] + sq_norms[None, :] - 2.0 * (emb @ emb.T)
         cost = mx.sqrt(mx.maximum(cost, 0.0))
-    cost = mx.maximum(cost, 0.0)
-    if squared:
-        cost = cost * cost
-    if normalize:
-        cost_max = mx.max(cost)
-        cost = cost / (cost_max + 1e-8)
-    return cost
+    return mx.maximum(cost, 0.0)
 
 
-def wasserstein_loss(logits: mx.array, targets: mx.array, cost_matrix: mx.array,
-                     focal_gamma: float = 0.0, softmax_temp: float = 1.0) -> mx.array:
-    """Compute Wasserstein-1 distance loss for one-hot targets.
-
-    For one-hot targets, the Wasserstein-1 distance simplifies to:
-        W = sum_i P(token_i) * cost(token_i, correct_token)
-
-    Args:
-        logits: raw model output scores (num_tokens, vocab_size)
-        targets: correct token IDs (num_tokens,)
-        cost_matrix: pairwise token distances (vocab_size, vocab_size)
-        focal_gamma: if >0, multiply loss by (1 - P(correct))^gamma
-                     to focus on hard tokens and prevent gradient vanishing
-        softmax_temp: temperature for softmax (>1 = softer, prevents
-                      Wasserstein gradients from vanishing as model gets confident)
-
-    Returns:
-        mean Wasserstein loss across all tokens
-    """
+def wasserstein_loss(logits: mx.array, targets: mx.array, cost_matrix: mx.array) -> mx.array:
+    """Wasserstein-1 loss for one-hot targets: W = sum(P(token) * distance(token, correct))."""
     logits_f32 = logits.astype(mx.float32)
-    # Numerically stable softmax with temperature
-    logits_scaled = logits_f32 / softmax_temp
-    logits_shifted = logits_scaled - mx.max(logits_scaled, axis=-1, keepdims=True)
+    logits_shifted = logits_f32 - mx.max(logits_f32, axis=-1, keepdims=True)
     exp_logits = mx.exp(logits_shifted)
     probs = exp_logits / mx.sum(exp_logits, axis=-1, keepdims=True)
-
-    # Look up cost row for each correct token
-    cost_rows = cost_matrix[targets]  # (num_tokens, vocab_size)
-
-    # Wasserstein-1: sum of P(token) * distance(token, correct)
-    per_token_loss = mx.sum(probs * cost_rows, axis=-1)  # (num_tokens,)
-
-    # Focal weighting: amplify loss on hard tokens, reduce on easy ones
-    if focal_gamma > 0.0:
-        # Get P(correct_token) for each position
-        # Use the original (non-temperature-scaled) probabilities for focal weight
-        logits_shifted_orig = logits_f32 - mx.max(logits_f32, axis=-1, keepdims=True)
-        exp_orig = mx.exp(logits_shifted_orig)
-        probs_orig = exp_orig / mx.sum(exp_orig, axis=-1, keepdims=True)
-        # Gather P(correct) for each token using index selection
-        num_tokens = targets.shape[0]
-        p_correct = probs_orig[mx.arange(num_tokens), targets]
-        # Focal weight: (1 - P(correct))^gamma
-        focal_weight = mx.power(1.0 - p_correct + 1e-8, focal_gamma)
-        per_token_loss = per_token_loss * focal_weight
-
+    cost_rows = cost_matrix[targets]
+    per_token_loss = mx.sum(probs * cost_rows, axis=-1)
     return mx.mean(per_token_loss)
 
 
 class GPT(nn.Module):
-    # - token embedding + RMSNorm
-    # - encoder half accumulates skip tensors
-    # - decoder half consumes reversed skips with learned skip_weights
-    # - tied embeddings for the LM head (the baseline default setup)
-    # - MODIFIED: hybrid cross-entropy + Wasserstein loss
+    # Combined: STP (smoothness) + Wasserstein (differentiated token weighting)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float, wasserstein_alpha: float = 0.9, wasserstein_cost_metric: str = "cosine",
-                 wasserstein_squared: bool = False, wasserstein_normalize: bool = False,
-                 wasserstein_focal_gamma: float = 0.0, wasserstein_softmax_temp: float = 1.0,
-                 wasserstein_delay_steps: int = 0, wasserstein_random_cost: bool = False):
+                 qk_gain_init: float, stp_beta: float = 0.005, stp_layer: str = "last",
+                 wasserstein_alpha: float = 0.9, wasserstein_cost_metric: str = "cosine"):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
+        self.stp_beta = stp_beta
+        self.stp_layer = stp_layer
         self.wasserstein_alpha = wasserstein_alpha
-        self.wasserstein_cost_metric = wasserstein_cost_metric
-        self.wasserstein_squared = wasserstein_squared
-        self.wasserstein_normalize = wasserstein_normalize
-        self.wasserstein_focal_gamma = wasserstein_focal_gamma
-        self.wasserstein_softmax_temp = wasserstein_softmax_temp
-        self.wasserstein_delay_steps = wasserstein_delay_steps
-        self._current_step = 0
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.num_encoder_layers = num_layers // 2
@@ -518,31 +456,37 @@ class GPT(nn.Module):
             mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
         ).astype(COMPUTE_DTYPE)
 
-        self.wasserstein_random_cost = wasserstein_random_cost
-        if wasserstein_random_cost:
-            # Random cost matrix — for ablation testing
-            vocab_size_val = self.tok_emb.weight.shape[0]
-            random_cost = mx.abs(mx.random.normal((vocab_size_val, vocab_size_val)))
-            # Make symmetric and zero diagonal
-            random_cost = (random_cost + random_cost.T) / 2.0
-            random_cost = random_cost - mx.diag(mx.diag(random_cost))
-            self._cost_matrix = random_cost
+        # Cost matrix for Wasserstein (only if not pure CE)
+        if wasserstein_alpha < 1.0:
+            self._cost_matrix = compute_cost_matrix(self.tok_emb.weight, wasserstein_cost_metric)
         else:
-            self._cost_matrix = compute_cost_matrix(
-                self.tok_emb.weight, self.wasserstein_cost_metric,
-                squared=self.wasserstein_squared, normalize=self.wasserstein_normalize)
+            self._cost_matrix = None
+        self._wasserstein_cost_metric = wasserstein_cost_metric
 
     def update_cost_matrix(self):
-        """Recompute cost matrix from current embeddings."""
-        if self.wasserstein_random_cost:
-            return  # don't update random cost matrix
-        self._cost_matrix = compute_cost_matrix(
-            self.tok_emb.weight, self.wasserstein_cost_metric,
-            squared=self.wasserstein_squared, normalize=self.wasserstein_normalize)
+        if self._cost_matrix is not None:
+            self._cost_matrix = compute_cost_matrix(self.tok_emb.weight, self._wasserstein_cost_metric)
 
     def softcap(self, logits: mx.array) -> mx.array:
         c = self.logit_softcap
         return c * mx.tanh(logits / c)
+
+    def forward_with_hidden(self, input_ids: mx.array) -> tuple[mx.array, list[mx.array]]:
+        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        x0 = x
+        skips: list[mx.array] = []
+        hidden_states: list[mx.array] = []
+
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0)
+            skips.append(x)
+            hidden_states.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            hidden_states.append(x)
+        return self.final_norm(x), hidden_states
 
     def __call__(self, input_ids: mx.array) -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
@@ -559,8 +503,7 @@ class GPT(nn.Module):
         return self.final_norm(x)
 
     def eval_loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
-        """Pure cross-entropy loss for evaluation. Always uses CE regardless of
-        training loss function, so val_bpb is comparable across all experiments."""
+        """Pure CE for evaluation — no STP, no Wasserstein."""
         x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
         y = target_ids.reshape(-1)
         logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
@@ -568,29 +511,39 @@ class GPT(nn.Module):
         return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
-        """Hybrid training loss. Uses CE + Wasserstein for training only."""
-        x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
-        y = target_ids.reshape(-1)
+        """Training loss: CE + STP smoothness + Wasserstein differentiation."""
+        # Get hidden states if STP is enabled
+        if self.stp_beta > 0:
+            final_output, hidden_states = self.forward_with_hidden(input_ids)
+            x = final_output.reshape(-1, self.tok_emb.weight.shape[1])
+        else:
+            x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
 
+        y = target_ids.reshape(-1)
         logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
         logits = self.softcap(logits_proj)
 
-        # Cross-entropy component (always computed)
+        # CE component
         ce_loss = nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
 
-        # Skip Wasserstein if pure CE or during delay period
-        if self.wasserstein_alpha >= 1.0 or self._current_step < self.wasserstein_delay_steps:
-            return ce_loss
+        # Wasserstein component
+        if self.wasserstein_alpha < 1.0 and self._cost_matrix is not None:
+            w_loss = wasserstein_loss(logits, y, self._cost_matrix)
+            ce_loss = self.wasserstein_alpha * ce_loss + (1.0 - self.wasserstein_alpha) * w_loss
 
-        # Wasserstein component with focal weighting and temperature
-        w_loss = wasserstein_loss(
-            logits, y, self._cost_matrix,
-            focal_gamma=self.wasserstein_focal_gamma,
-            softmax_temp=self.wasserstein_softmax_temp,
-        )
+        # STP component
+        if self.stp_beta > 0:
+            if self.stp_layer == "last":
+                stp_loss = stp_smoothness_loss(hidden_states[-1].astype(mx.float32))
+            elif self.stp_layer == "all":
+                stp_loss = mx.mean(mx.array([
+                    stp_smoothness_loss(h.astype(mx.float32)) for h in hidden_states
+                ]))
+            else:
+                stp_loss = stp_smoothness_loss(hidden_states[int(self.stp_layer)].astype(mx.float32))
+            ce_loss = ce_loss + self.stp_beta * stp_loss
 
-        # Hybrid: alpha * CE + (1 - alpha) * Wasserstein
-        return self.wasserstein_alpha * ce_loss + (1.0 - self.wasserstein_alpha) * w_loss
+        return ce_loss
 
 # ==============================================================================
 # OPTIMIZERS (MUON + ADAM SPLIT)
@@ -1038,19 +991,12 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        stp_beta=args.stp_beta,
+        stp_layer=args.stp_layer,
         wasserstein_alpha=args.wasserstein_alpha,
         wasserstein_cost_metric=args.wasserstein_cost_metric,
-        wasserstein_squared=args.wasserstein_squared,
-        wasserstein_normalize=args.wasserstein_normalize,
-        wasserstein_focal_gamma=args.wasserstein_focal_gamma,
-        wasserstein_softmax_temp=args.wasserstein_softmax_temp,
-        wasserstein_delay_steps=args.wasserstein_delay_steps,
-        wasserstein_random_cost=args.wasserstein_random_cost,
     )
-    log(f"wasserstein_alpha:{args.wasserstein_alpha} cost_metric:{args.wasserstein_cost_metric} "
-        f"cost_update_every:{args.wasserstein_cost_update_every} squared:{args.wasserstein_squared} "
-        f"normalize:{args.wasserstein_normalize} focal_gamma:{args.wasserstein_focal_gamma} "
-        f"softmax_temp:{args.wasserstein_softmax_temp} delay_steps:{args.wasserstein_delay_steps}")
+    log(f"stp_beta:{args.stp_beta} stp_layer:{args.stp_layer} wasserstein_alpha:{args.wasserstein_alpha}")
     opt = SplitOptimizers(model, args)
 
     # ==============================================================================
@@ -1060,8 +1006,7 @@ def main() -> None:
     # inside RoPE modules), so compiling only against trainable parameters throws "uncaptured inputs".
     # Compiling the model-bound functions and capturing the full model state fixes that while still
     # returning gradients only for trainable parameters via nn.value_and_grad(...).
-    # compiled_eval_loss: always pure CE — used for validation (comparable across experiments)
-    # compiled_loss_and_grad: hybrid loss — used for training only
+    # eval uses pure CE; training uses CE + STP + Wasserstein
     compiled_loss = mx.compile(lambda x, y: model.eval_loss(x, y), inputs=model.state, outputs=model.state)
     compiled_loss_and_grad = mx.compile(
         nn.value_and_grad(model, lambda x, y: model.loss(x, y)),
@@ -1199,16 +1144,15 @@ def main() -> None:
         opt.step(model, grads, step=step, lr_mul=lr_mul)
         mx.synchronize()
 
-        # Periodically recompute Wasserstein cost matrix from updated embeddings
+        step_ms = 1000.0 * (time.perf_counter() - step_t0)
+        approx_train_time_ms = train_time_ms + 1000.0 * (time.perf_counter() - t0)
+        tok_s = args.train_batch_tokens / (step_ms / 1000.0)
+        # Periodically recompute Wasserstein cost matrix
         if args.wasserstein_alpha < 1.0 and step % args.wasserstein_cost_update_every == 0:
             model.update_cost_matrix()
             mx.eval(model._cost_matrix)
 
-        step_ms = 1000.0 * (time.perf_counter() - step_t0)
-        approx_train_time_ms = train_time_ms + 1000.0 * (time.perf_counter() - t0)
-        tok_s = args.train_batch_tokens / (step_ms / 1000.0)
         step += 1
-        model._current_step = step
         if args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None):
             log(
                 f"step:{step}/{args.iterations} train_loss:{train_loss_value:.4f} "
