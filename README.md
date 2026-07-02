@@ -1,3 +1,20 @@
+# Research in this fork
+
+This fork contains my independent research for the OpenAI Parameter Golf challenge (train the best language model that fits in a 16MB artifact in under 10 minutes on 8xH100s). **The original challenge README is preserved below the divider.**
+
+**Pranay Lakkaraju** ([@pralakk16](https://github.com/pralakk16)) — four experiment threads across architecture, loss functions, and hardware-efficient recurrence:
+
+| Thread | Finding | Write-up |
+|---|---|---|
+| **Hourglass MLP + per-head attention gating** | Wide-narrow-wide MLP shaping plus a ~50K-parameter per-head confidence gate beats the 9L baseline by 0.29 BPB at matched compute, with the gap *growing* 2.97x over 5x more training. Gate analysis shows the last attention layer of a 12L transformer learns to exactly 0.000 — functionally unused. Includes 12 documented negative results. | [research/hourglass-attention-gating.md](research/hourglass-attention-gating.md) |
+| **Hybrid cross-entropy + Wasserstein-1 loss** | Up to 0.86 BPB improvement at smoke scale — but my own ablation shows *random* cost matrices work as well as semantic ones, killing the optimal-transport explanation. An honest open question about differentiated gradient weighting, with the controls that prevented an exciting-but-wrong claim. | [research/wasserstein-hybrid-loss.md](research/wasserstein-hybrid-loss.md) |
+| **CfC "liquid" networks on H100** | Ported MIT's Closed-form Continuous-time networks into the challenge harness three ways (torch.compile → hand-written Triton → fla chunk_hgrn parallel scan). Better per-step learning than the transformer baseline, but ~6.4x slower wall-clock: sequential recurrence loses under a 10-minute budget until the CfC update gets a true chunked kernel. | [research/cfc-liquid-networks.md](research/cfc-liquid-networks.md) |
+| **GDN-Hybrid replication** | Reproduced the Gated DeltaNet hybrid from upstream PR #1545 for independent testing (`gdn_hybrid/`, `train_gpt_mlx_deltanet.py`). | — |
+
+All experiment scripts are in the repo root (`train_gpt_mlx_*.py` variants, `train_gpt_cfc_*.py`, `analyze_attn_gate.py`; architecture diagrams in `diagrams/`). Local-scale BPB numbers are internally controlled but not comparable to the 8xH100 leaderboard — see the compute-regime caveat in each write-up.
+
+---
+
 <img width="3840" height="1280" alt="1920x640-discord" src="https://github.com/user-attachments/assets/90607b26-171f-476a-90ae-69b9dbb7cb30" />
 
 <br>
